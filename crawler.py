@@ -19,7 +19,7 @@ import os
 import random
 random.seed(42)
 from datetime import datetime
-from urllib.parse import urlsplit, urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit, unquote
 from urllib.robotparser import RobotFileParser
 
 import requests
@@ -66,8 +66,8 @@ CRAWLER_CONFIG = {
     "request_timeout":  10,
     "use_selenium":     True,
     "selenium_timeout": 8,
-    "gecko_driver":     "./geckodriver",
-    "max_pages":        5000,
+    "gecko_driver":     "./geckodriver.exe",
+    "max_pages":        50,
     "target_description": "",
 }
 
@@ -635,32 +635,131 @@ class Fetcher:
 # URL utilities
 # ============================================================
 
+def _strip_default_port(scheme: str, netloc: str) -> str:
+    """Remove :80 / :443 when it is the real port (works with user@host:port and [IPv6]:port)."""
+    netloc = netloc.lower()
+    if scheme == "http" and netloc.endswith(":80"):
+        base, _, port = netloc.rpartition(":")
+        if port == "80":
+            return base
+    if scheme == "https" and netloc.endswith(":443"):
+        base, _, port = netloc.rpartition(":")
+        if port == "443":
+            return base
+    return netloc
+
+
+def _normalize_path(path: str) -> str:
+    """Percent-decode, collapse slashes, resolve . and .., strip trailing slash (except root)."""
+    raw = unquote(path or "")
+    if not raw.startswith("/"):
+        raw = "/" + raw
+    parts: list[str] = []
+    for part in raw.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if parts:
+                parts.pop()
+        else:
+            parts.append(part)
+    out = "/" + "/".join(parts) if parts else "/"
+    if len(out) > 1 and out.endswith("/"):
+        out = out.rstrip("/")
+    return out
+
+
 def normalize_url(url: str) -> str:
-    """Normalize a URL: lowercase scheme+host, remove fragment, sort params."""
+    """
+    Canonical form for storage: lowercase scheme and host, default ports dropped,
+    path normalized, query keys sorted, fragment removed.
+    Protocol-relative URLs (//host/path) are fixed to https://…
+    """
+    url = url.strip()
     try:
         p = urlsplit(url)
-        return p._replace(
-            scheme=p.scheme.lower(),
-            netloc=p.netloc.lower(),
-            fragment="",
-        ).geturl()
+        scheme = (p.scheme or "").lower()
+        netloc = p.netloc or ""
+        # //example.com/foo — urlsplit leaves scheme empty but sets netloc
+        if not scheme and netloc:
+            scheme = "https"
+        if not scheme:
+            return url
+        netloc = _strip_default_port(scheme, netloc)
+        if not netloc:
+            return url
+        path = _normalize_path(p.path)
+        pairs = parse_qsl(p.query, keep_blank_values=True)
+        pairs.sort(key=lambda kv: (kv[0], kv[1]))
+        query = urlencode(pairs, doseq=True)
+        return urlunsplit((scheme, netloc, path, query, ""))
     except Exception:
         return url
 
 
+# Quoted URL targets inside onclick handlers (location.href, window.location, etc.)
+_ONCLICK_URL_RES = (
+    re.compile(r"""location\.href\s*=\s*["']([^"'\\]+)["']""", re.I),
+    re.compile(r"""window\.location(?:\.href)?\s*=\s*["']([^"'\\]+)["']""", re.I),
+    re.compile(r"""document\.location(?:\.href)?\s*=\s*["']([^"'\\]+)["']""", re.I),
+    re.compile(r"""(?:top|parent|self)\.location(?:\.href)?\s*=\s*["']([^"'\\]+)["']""", re.I),
+    re.compile(r"""location\.(?:assign|replace)\s*\(\s*["']([^"'\\]+)["']""", re.I),
+    re.compile(r"""window\.open\s*\(\s*["']([^"'\\]+)["']""", re.I),
+)
+
+
+def _raw_targets_from_onclick(handler: str) -> list[str]:
+    if not handler or not str(handler).strip():
+        return []
+    text = str(handler)
+    seen: set[str] = set()
+    out: list[str] = []
+    for pat in _ONCLICK_URL_RES:
+        for m in pat.finditer(text):
+            u = m.group(1).strip()
+            if u and u not in seen:
+                seen.add(u)
+                out.append(u)
+    return out
+
+
+def _is_extractable_href(raw: str) -> bool:
+    if not raw:
+        return False
+    low = raw.strip().lower()
+    if low.startswith(("javascript:", "mailto:", "tel:", "#")):
+        return False
+    return True
+
+
 def extract_links(html: str, base_url: str) -> list[tuple[str, object]]:
-    """Return list of (absolute_url, a_tag) from HTML."""
+    """Return (absolute_url, tag) from <a href> and onclick targets (e.g. location.href)."""
     soup = BeautifulSoup(html, "html.parser")
-    parsed_base = urlsplit(base_url)
-    base_origin = f"{parsed_base.scheme}://{parsed_base.netloc}"
-    links = []
+    links: list[tuple[str, object]] = []
+
     for tag in soup.find_all("a", href=True):
         href = tag["href"].strip()
-        if href.startswith("javascript:") or href.startswith("mailto:"):
+        if not _is_extractable_href(href):
             continue
-        abs_url = urljoin(base_url, href)
-        abs_url = normalize_url(abs_url)
+        abs_url = normalize_url(urljoin(base_url, href))
+        if not urlsplit(abs_url).netloc:
+            continue
         links.append((abs_url, tag))
+
+    for tag in soup.find_all(onclick=True):
+        handler = tag.get("onclick")
+        if handler is None:
+            continue
+        if isinstance(handler, list):
+            handler = " ".join(str(x) for x in handler)
+        for raw in _raw_targets_from_onclick(handler):
+            if not _is_extractable_href(raw):
+                continue
+            abs_url = normalize_url(urljoin(base_url, raw))
+            if not urlsplit(abs_url).netloc:
+                continue
+            links.append((abs_url, tag))
+
     return links
 
 
@@ -675,15 +774,15 @@ def extract_images(html: str, base_url: str) -> list[str]:
 
 
 def get_domain(url: str) -> str:
-    p = urlsplit(url)
+    """Origin for site rows — must match normalize_url (lowercase host, no default ports)."""
+    norm = normalize_url(url)
+    p = urlsplit(norm)
     return f"{p.scheme}://{p.netloc}"
 
 
 def content_hash(html: str) -> str:
-    """MD5 of stripped page text for duplicate detection."""
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(strip=True)
-    return hashlib.md5(text.encode()).hexdigest()
+    """MD5 of raw HTML (UTF-8), matching PostgreSQL md5(html_content)."""
+    return hashlib.md5(html.encode("utf-8", errors="replace")).hexdigest()
 
 
 def parse_sitemap(text: str, base_url: str) -> list[str]:
