@@ -79,6 +79,10 @@ CRAWLER_CONFIG = {
     "lsh_rows": 4,
     "near_dup_min_unigrams": 20,
     "near_dup_max_unigrams": 8000,
+    # Submission-friendly storage policy: keep metadata rows, skip binary payload bytes.
+    "store_image_payload": False,
+    "store_binary_payload": False,  # .doc/.docx/.ppt/.pptx/.xls/.xlsx
+    "store_pdf_payload": False,     # set True only if your domain requires PDF content
 }
 
 
@@ -298,7 +302,14 @@ class CrawlerDB:
         finally:
             self._release(conn)
 
-    def store_binary(self, page_id: int, data: bytes, data_type: str, status: int):
+    def store_binary(
+        self,
+        page_id: int,
+        data: bytes | None,
+        data_type: str,
+        status: int,
+        store_payload: bool = False,
+    ):
         conn = self._conn()
         try:
             with conn:
@@ -314,12 +325,23 @@ class CrawlerDB:
                 cur.execute(
                     """INSERT INTO crawldb.page_data (page_id, data_type, data)
                        VALUES (%s, %s, %s)""",
-                    (page_id, data_type, psycopg2.Binary(data)),
+                    (
+                        page_id,
+                        data_type,
+                        psycopg2.Binary(data) if (store_payload and data) else None,
+                    ),
                 )
         finally:
             self._release(conn)
 
-    def store_image(self, page_id: int, filename: str, content_type: str, data: bytes):
+    def store_image(
+        self,
+        page_id: int,
+        filename: str,
+        content_type: str,
+        data: bytes | None,
+        store_payload: bool = False,
+    ):
         conn = self._conn()
         try:
             with conn:
@@ -327,7 +349,13 @@ class CrawlerDB:
                 cur.execute(
                     """INSERT INTO crawldb.image (page_id, filename, content_type, data, accessed_time)
                        VALUES (%s, %s, %s, %s, %s)""",
-                    (page_id, filename, content_type, psycopg2.Binary(data), datetime.now()),
+                    (
+                        page_id,
+                        filename,
+                        content_type,
+                        psycopg2.Binary(data) if (store_payload and data) else None,
+                        datetime.now(),
+                    ),
                 )
         finally:
             self._release(conn)
@@ -1348,7 +1376,19 @@ class CrawlerWorker(threading.Thread):
             ext = "." + path.rsplit(".", 1)[-1] if "." in path else ""
             dtype = BINARY_EXTENSIONS.get(ext, "OTHER")
             if result["binary_data"]:
-                self.db.store_binary(page_id, result["binary_data"], dtype, status)
+                # Store metadata by default; keep payload only when explicitly enabled.
+                store_payload = (
+                    CRAWLER_CONFIG["store_pdf_payload"]
+                    if dtype == "PDF"
+                    else CRAWLER_CONFIG["store_binary_payload"]
+                )
+                self.db.store_binary(
+                    page_id,
+                    result["binary_data"],
+                    dtype,
+                    status,
+                    store_payload=store_payload,
+                )
             return
 
         # No HTML
@@ -1464,7 +1504,13 @@ class CrawlerWorker(threading.Thread):
                 if r.status_code == 200:
                     filename = img_url.split("/")[-1].split("?")[0] or "image"
                     ct = r.headers.get("Content-Type", "image/unknown")
-                    self.db.store_image(page_id, filename, ct, r.content)
+                    self.db.store_image(
+                        page_id,
+                        filename,
+                        ct,
+                        r.content,
+                        store_payload=CRAWLER_CONFIG["store_image_payload"],
+                    )
             except Exception:
                 pass
 
