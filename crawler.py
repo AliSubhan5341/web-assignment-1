@@ -14,6 +14,7 @@ import time
 import threading
 import hashlib
 import re
+import struct
 import logging
 import os
 import random
@@ -69,6 +70,13 @@ CRAWLER_CONFIG = {
     "gecko_driver":     "./geckodriver.exe",
     "max_pages":        50,
     "target_description": "",
+    # Bonus: near-duplicate detection (MinHash LSH + Jaccard on unigrams)
+    "near_duplicate_lsh": True,
+    "jaccard_threshold": 0.88,
+    "lsh_bands": 16,
+    "lsh_rows": 4,
+    "near_dup_min_unigrams": 20,
+    "near_dup_max_unigrams": 8000,
 }
 
 
@@ -391,6 +399,24 @@ class CrawlerDB:
                 )
                 row = cur.fetchone()
                 return row[0] if row else None
+        finally:
+            self._release(conn)
+
+    def get_html_for_page(self, page_id: int) -> str | None:
+        """Return stored HTML for an HTML page (for Jaccard verification)."""
+        conn = self._conn()
+        try:
+            with conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """SELECT html_content FROM crawldb.page
+                       WHERE id = %s AND page_type = 'HTML'""",
+                    (page_id,),
+                )
+                row = cur.fetchone()
+                if not row or row[0] is None:
+                    return None
+                return row[0]
         finally:
             self._release(conn)
 
@@ -785,6 +811,100 @@ def content_hash(html: str) -> str:
     return hashlib.md5(html.encode("utf-8", errors="replace")).hexdigest()
 
 
+# ============================================================
+# Near-duplicate detection (bonus: MinHash LSH + Jaccard / unigrams)
+# ------------------------------------------------------------
+# Parameters (for the report):
+#   lsh_bands (b)     — 16 bands; more bands → more buckets, fewer false candidates each.
+#   lsh_rows (r)      — 4 MinHash values per band; signature length = b*r = 64.
+#   jaccard_threshold — τ = 0.88; pages with Jaccard(unigrams) ≥ τ are near-duplicates.
+#   P(collision) ≈ 1 - (1 - J^r)^b for similarity J (MinHash theory).
+# Flow: exact MD5 first; then LSH finds candidate ids sharing ≥1 band bucket;
+#       Jaccard on alphanumeric unigrams from visible text confirms.
+# ============================================================
+
+
+def html_unigrams(
+    html: str,
+    max_tokens: int | None = None,
+) -> frozenset[str]:
+    """Lowercased alphanumeric unigrams from stripped visible text."""
+    if max_tokens is None:
+        max_tokens = CRAWLER_CONFIG["near_dup_max_unigrams"]
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(separator=" ", strip=True).lower()
+    words = re.findall(r"[a-z0-9]+", text)
+    if len(words) > max_tokens:
+        step = max(1, len(words) // max_tokens)
+        words = words[::step][:max_tokens]
+    return frozenset(words)
+
+
+def jaccard_similarity(a: frozenset[str], b: frozenset[str]) -> float:
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    uni = len(a | b)
+    return inter / uni if uni else 0.0
+
+
+def _minhash_component(j: int, token: str) -> int:
+    digest = hashlib.md5(
+        str(j).encode("ascii") + b"\x00" + token.encode("utf-8", errors="replace")
+    ).digest()
+    return int.from_bytes(digest[:8], "big", signed=False)
+
+
+def minhash_signature(unigrams: frozenset[str], num_perm: int) -> tuple[int, ...]:
+    """MinHash signature: for each permutation j, min_{t in unigrams} h_j(t)."""
+    if not unigrams:
+        return tuple(0xFFFFFFFFFFFFFFFF for _ in range(num_perm))
+    sig = []
+    for j in range(num_perm):
+        m = min(_minhash_component(j, t) for t in unigrams)
+        sig.append(m)
+    return tuple(sig)
+
+
+def _band_bucket_hash(sub_signature: tuple[int, ...]) -> int:
+    buf = b"".join(struct.pack(">Q", x & 0xFFFFFFFFFFFFFFFF) for x in sub_signature)
+    return int.from_bytes(hashlib.md5(buf).digest()[:8], "big", signed=False)
+
+
+class MinHashLSHIndex:
+    """
+    Thread-safe LSH index: pages that share any band bucket are candidate duplicates.
+    """
+
+    def __init__(self, num_bands: int, rows_per_band: int):
+        self.num_bands = num_bands
+        self.rows_per_band = rows_per_band
+        self.num_perm = num_bands * rows_per_band
+        self._lock = threading.Lock()
+        self._buckets: dict[tuple[int, int], list[int]] = {}
+
+    def find_candidate_ids(self, signature: tuple[int, ...]) -> set[int]:
+        out: set[int] = set()
+        r = self.rows_per_band
+        with self._lock:
+            for b in range(self.num_bands):
+                sub = signature[b * r : (b + 1) * r]
+                key = (b, _band_bucket_hash(sub))
+                for pid in self._buckets.get(key, ()):
+                    out.add(pid)
+        return out
+
+    def insert(self, page_id: int, signature: tuple[int, ...]) -> None:
+        r = self.rows_per_band
+        with self._lock:
+            for b in range(self.num_bands):
+                sub = signature[b * r : (b + 1) * r]
+                key = (b, _band_bucket_hash(sub))
+                self._buckets.setdefault(key, []).append(page_id)
+
+
 def parse_sitemap(text: str, base_url: str) -> list[str]:
     """Extract <loc> URLs from a sitemap XML."""
     soup = BeautifulSoup(text, "xml")
@@ -1066,6 +1186,7 @@ class CrawlerWorker(threading.Thread):
         stop_event: threading.Event,
         allowed_domains: list[str] | None,
         github_extractor: GitHubExtractor,
+        near_dup_index: MinHashLSHIndex | None,
         name: str,
     ):
         super().__init__(name=name, daemon=True)
@@ -1078,6 +1199,7 @@ class CrawlerWorker(threading.Thread):
         self._stop_event = stop_event
         self._allowed = [d.lower() for d in (allowed_domains or [])]
         self._github = github_extractor
+        self._near_dup_index = near_dup_index
 
     def run(self):
         while not self._stop_event.is_set():
@@ -1168,8 +1290,45 @@ class CrawlerWorker(threading.Thread):
             self.db.mark_duplicate(page_id, existing, status)
             return
 
+        sig_nd: tuple[int, ...] | None = None
+        uni_nd: frozenset[str] | None = None
+        if CRAWLER_CONFIG.get("near_duplicate_lsh") and self._near_dup_index is not None:
+            min_u = CRAWLER_CONFIG["near_dup_min_unigrams"]
+            tau = CRAWLER_CONFIG["jaccard_threshold"]
+            uni_nd = html_unigrams(html)
+            if len(uni_nd) >= min_u:
+                sig_nd = minhash_signature(uni_nd, self._near_dup_index.num_perm)
+                # Among all LSH candidates with Jaccard ≥ τ, pick best J (then lowest id = stable canonical).
+                near_matches: list[tuple[float, int]] = []
+                for cand_id in self._near_dup_index.find_candidate_ids(sig_nd):
+                    if cand_id == page_id:
+                        continue
+                    old_html = self.db.get_html_for_page(cand_id)
+                    if not old_html:
+                        continue
+                    uni2 = html_unigrams(old_html)
+                    j = jaccard_similarity(uni_nd, uni2)
+                    if j >= tau:
+                        near_matches.append((j, cand_id))
+                if near_matches:
+                    near_matches.sort(key=lambda t: (-t[0], t[1]))
+                    best_j, best_c = near_matches[0]
+                    log.info(
+                        "Near-duplicate (Jaccard=%.3f >= %.2f): page %s same as %s — %s",
+                        best_j,
+                        tau,
+                        page_id,
+                        best_c,
+                        url,
+                    )
+                    self.db.mark_duplicate(page_id, best_c, status)
+                    return
+
         # Store page
         self.db.store_page(page_id, html, status)
+
+        if sig_nd is not None:
+            self._near_dup_index.insert(page_id, sig_nd)
 
         # GitHub structured extraction + README re-scoring (Option A)
         repo_match = _is_repo_url(url)
@@ -1281,6 +1440,21 @@ class Crawler:
         self._domain_lock = threading.Lock()
         self._stop_event = threading.Event()
 
+        if CRAWLER_CONFIG.get("near_duplicate_lsh"):
+            self.near_dup_index = MinHashLSHIndex(
+                num_bands=CRAWLER_CONFIG["lsh_bands"],
+                rows_per_band=CRAWLER_CONFIG["lsh_rows"],
+            )
+            log.info(
+                "Near-duplicate LSH enabled: bands=%s rows=%s (sig=%s), Jaccard τ=%s",
+                CRAWLER_CONFIG["lsh_bands"],
+                CRAWLER_CONFIG["lsh_rows"],
+                CRAWLER_CONFIG["lsh_bands"] * CRAWLER_CONFIG["lsh_rows"],
+                CRAWLER_CONFIG["jaccard_threshold"],
+            )
+        else:
+            self.near_dup_index = None
+
     # ----------------------------------------------------------
 
     def _bootstrap_domain(self, url: str) -> int:
@@ -1344,6 +1518,7 @@ class Crawler:
                 stop_event=self._stop_event,
                 allowed_domains=self.allowed_domains,
                 github_extractor=self.github_extractor,
+                near_dup_index=self.near_dup_index,
                 name=f"Worker-{i+1}",
             )
             w.start()
