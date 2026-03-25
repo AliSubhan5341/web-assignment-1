@@ -17,6 +17,8 @@ import re
 import struct
 import logging
 import os
+import math
+import socket
 import random
 random.seed(42)
 from datetime import datetime
@@ -68,7 +70,7 @@ CRAWLER_CONFIG = {
     "use_selenium":     True,
     "selenium_timeout": 8,
     "gecko_driver":     "./geckodriver.exe",
-    "max_pages":        50,
+    "max_pages":        100,
     "target_description": "",
     # Bonus: near-duplicate detection (MinHash LSH + Jaccard on unigrams)
     "near_duplicate_lsh": True,
@@ -241,8 +243,11 @@ class CrawlerDB:
         try:
             with conn:
                 cur = conn.cursor()
+                # Important: `pop_next_frontier()` temporarily marks a claimed row as
+                # `page_type='HTML'` before fetching. Use `accessed_time` instead
+                # so the count reflects *completed* fetches only.
                 cur.execute(
-                    "SELECT COUNT(*) FROM crawldb.page WHERE page_type != 'FRONTIER'"
+                    "SELECT COUNT(*) FROM crawldb.page WHERE accessed_time IS NOT NULL"
                 )
                 return cur.fetchone()[0]
         finally:
@@ -393,7 +398,9 @@ class CrawlerDB:
                 cur.execute(
                     """SELECT id FROM crawldb.page
                        WHERE page_type = 'HTML'
+                         AND html_content IS NOT NULL
                          AND md5(html_content) = %s
+                       ORDER BY id ASC
                        LIMIT 1""",
                     (content_hash,),
                 )
@@ -462,6 +469,40 @@ class RobotsCache:
             return r.text if r.status_code == 200 else ""
         except Exception:
             return ""
+
+    def get_crawl_delay(self, base_url: str) -> int:
+        """
+        UA-aware crawl-delay extraction using RobotFileParser.
+        Returns an integer seconds delay; falls back to CRAWLER_CONFIG default.
+        """
+        parsed = urlsplit(base_url)
+        if parsed.scheme and parsed.netloc:
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+        else:
+            origin = base_url
+
+        with self._lock:
+            if origin not in self._cache:
+                rp = RobotFileParser()
+                rp.set_url(origin + "/robots.txt")
+                try:
+                    rp.read()
+                except Exception:
+                    # If robots.txt can't be fetched/parsed, behave as allow-all
+                    rp = RobotFileParser()
+                self._cache[origin] = rp
+
+            delay = self._cache[origin].crawl_delay(self._ua)
+            if delay is None:
+                # Try wildcard groups if specific UA isn't present
+                delay = self._cache[origin].crawl_delay("*")
+
+        if delay is None:
+            return CRAWLER_CONFIG["default_delay"]
+        try:
+            return max(0, int(math.ceil(float(delay))))
+        except Exception:
+            return CRAWLER_CONFIG["default_delay"]
 
     def get_sitemaps(self, base_url: str, robots_text: str) -> list[str]:
         """Parse Sitemap: lines from robots.txt."""
@@ -1181,8 +1222,10 @@ class CrawlerWorker(threading.Thread):
         fetcher: Fetcher,
         robots: RobotsCache,
         priority_calc: PriorityCalculator,
-        domain_timestamps: dict,
-        domain_lock: threading.Lock,
+        ip_timestamps: dict,
+        ip_lock: threading.Lock,
+        dns_cache: dict,
+        dns_lock: threading.Lock,
         stop_event: threading.Event,
         allowed_domains: list[str] | None,
         github_extractor: GitHubExtractor,
@@ -1194,12 +1237,44 @@ class CrawlerWorker(threading.Thread):
         self.fetcher = fetcher
         self.robots = robots
         self.priority = priority_calc
-        self._domain_timestamps = domain_timestamps
-        self._domain_lock = domain_lock
+        self._ip_timestamps = ip_timestamps
+        self._ip_lock = ip_lock
+        self._dns_cache = dns_cache
+        self._dns_lock = dns_lock
         self._stop_event = stop_event
         self._allowed = [d.lower() for d in (allowed_domains or [])]
         self._github = github_extractor
         self._near_dup_index = near_dup_index
+
+    def _resolve_hostname_ips(self, hostname: str) -> list[str]:
+        """
+        Resolve hostname to a set of IP strings (v4/v6) for IP-based throttling.
+        Uses a small in-memory cache shared across workers.
+        """
+        if not hostname:
+            return []
+        hostname = hostname.lower()
+        with self._dns_lock:
+            if hostname in self._dns_cache:
+                return list(self._dns_cache[hostname])
+
+        ips: set[str] = set()
+        try:
+            # getaddrinfo returns potentially multiple address families
+            infos = socket.getaddrinfo(hostname, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
+            for info in infos:
+                sockaddr = info[4]
+                if not sockaddr:
+                    continue
+                ip = sockaddr[0]
+                if ip:
+                    ips.add(ip)
+        except Exception:
+            ips = set()
+
+        with self._dns_lock:
+            self._dns_cache[hostname] = ips
+        return list(ips)
 
     def run(self):
         while not self._stop_event.is_set():
@@ -1250,7 +1325,7 @@ class CrawlerWorker(threading.Thread):
             return
 
         # Crawl delay
-        self._respect_delay(domain, site_id)
+        self._respect_delay(url, site_id)
 
         # Fetch
         result = self.fetcher.fetch(url)
@@ -1261,8 +1336,9 @@ class CrawlerWorker(threading.Thread):
         if final_url != url:
             redirect_site_id = self._ensure_site(final_url)
             new_id = self.db.add_frontier_url(final_url, redirect_site_id)
-            if new_id:
-                self.db.store_link(page_id, final_url, redirect_site_id)
+            # Even if the redirected URL was already parsed, we must still record
+            # the link edge. Only enqueue when it's actually new.
+            self.db.store_link(page_id, final_url, redirect_site_id)
             self.db.store_page(page_id, None, status, "HTML")
             return
 
@@ -1394,14 +1470,34 @@ class CrawlerWorker(threading.Thread):
 
     # ----------------------------------------------------------
 
-    def _respect_delay(self, domain: str, site_id: int):
+    def _respect_delay(self, url: str, site_id: int):
+        """
+        Throttle by resolved IPs for the hostname in `url`.
+        Reserves a next-allowed timestamp per IP, then sleeps outside the lock.
+        """
         delay = self.db.get_crawl_delay(site_id)
-        with self._domain_lock:
-            last = self._domain_timestamps.get(domain, 0)
-            wait = delay - (time.time() - last)
-            if wait > 0:
-                time.sleep(wait)
-            self._domain_timestamps[domain] = time.time()
+        now = time.time()
+        host = urlsplit(url).hostname
+        ips = self._resolve_hostname_ips(host)
+
+        # If DNS fails, fall back to hostname-based throttling to avoid flooding.
+        if not ips:
+            ips = [host.lower() if host else url]
+
+        # Compute a reservation time that satisfies all resolved IPs.
+        with self._ip_lock:
+            next_allowed = now
+            for ip in ips:
+                last = self._ip_timestamps.get(ip, 0)
+                wait = delay - (now - last)
+                if wait > 0:
+                    next_allowed = max(next_allowed, now + wait)
+            for ip in ips:
+                self._ip_timestamps[ip] = next_allowed
+
+        wait_total = next_allowed - now
+        if wait_total > 0:
+            time.sleep(wait_total)
 
     def _ensure_site(self, url: str) -> int:
         domain = get_domain(url)
@@ -1436,8 +1532,10 @@ class Crawler:
         self.priority_calc = PriorityCalculator(self.target_description)
         self.github_extractor = GitHubExtractor(self.db, self.priority_calc)
 
-        self._domain_timestamps: dict[str, float] = {}
-        self._domain_lock = threading.Lock()
+        self._ip_timestamps: dict[str, float] = {}
+        self._ip_lock = threading.Lock()
+        self._dns_cache: dict[str, set[str]] = {}
+        self._dns_lock = threading.Lock()
         self._stop_event = threading.Event()
 
         if CRAWLER_CONFIG.get("near_duplicate_lsh"):
@@ -1482,14 +1580,10 @@ class Crawler:
             except Exception:
                 pass
 
-        # Extract crawl delay from robots
-        delay = CRAWLER_CONFIG["default_delay"]
-        for line in robots_text.splitlines():
-            if line.lower().startswith("crawl-delay:"):
-                try:
-                    delay = int(line.split(":", 1)[1].strip())
-                except ValueError:
-                    pass
+        # Extract crawl delay from robots.txt for this crawler's UA.
+        # Using RobotFileParser avoids incorrect parsing when robots.txt
+        # defines multiple User-agent groups.
+        delay = self.robots.get_crawl_delay(domain)
 
         self.db.update_site_robots(site_id, robots_text, sitemap_text, delay)
         return site_id
@@ -1513,8 +1607,10 @@ class Crawler:
                 fetcher=self.fetcher,
                 robots=self.robots,
                 priority_calc=self.priority_calc,
-                domain_timestamps=self._domain_timestamps,
-                domain_lock=self._domain_lock,
+                ip_timestamps=self._ip_timestamps,
+                ip_lock=self._ip_lock,
+                dns_cache=self._dns_cache,
+                dns_lock=self._dns_lock,
                 stop_event=self._stop_event,
                 allowed_domains=self.allowed_domains,
                 github_extractor=self.github_extractor,
