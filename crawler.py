@@ -17,6 +17,7 @@ import re
 import struct
 import logging
 import os
+import argparse
 import math
 import socket
 import random
@@ -1702,18 +1703,133 @@ class Crawler:
 # ============================================================
 
 if __name__ == "__main__":
-    SEED_URLS = [
-        "https://github.com/topics/foss",
-        "https://github.com/topics/open-source",
-        "https://github.com/topics/free-software",
-    ]
-    ALLOWED_DOMAINS = ["https://github.com"]
+    def _csv_list(value: str) -> list[str]:
+        return [v.strip() for v in value.split(",") if v.strip()]
 
-    TARGET_DESCRIPTION = "open source foss free software repository project"
+    parser = argparse.ArgumentParser(description="Preferential web crawler (WIER PA1)")
+    parser.add_argument(
+        "--seed",
+        action="append",
+        default=[],
+        help="Seed URL (repeat flag for multiple). Example: --seed https://example.com",
+    )
+    parser.add_argument(
+        "--allowed-domain",
+        action="append",
+        default=[],
+        help="Allowed domain/prefix (repeat flag for multiple). Example: --allowed-domain https://example.com",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=CRAWLER_CONFIG["num_workers"],
+        help="Number of parallel worker threads.",
+    )
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=CRAWLER_CONFIG["max_pages"],
+        help="Stop after N crawled pages (0 = no limit).",
+    )
+    parser.add_argument(
+        "--target-description",
+        type=str,
+        default="open source foss free software repository project",
+        help="Text describing target topic for preferential crawling.",
+    )
+    parser.add_argument(
+        "--use-selenium",
+        type=int,
+        choices=[0, 1],
+        default=1 if CRAWLER_CONFIG.get("use_selenium", False) else 0,
+        help="1 to enable Selenium rendering, 0 to use requests-only fetching.",
+    )
+    parser.add_argument(
+        "--gecko-driver",
+        type=str,
+        default=CRAWLER_CONFIG.get("gecko_driver", "./geckodriver.exe"),
+        help="Path to geckodriver executable (Windows: geckodriver.exe).",
+    )
+    parser.add_argument(
+        "--db-host",
+        type=str,
+        default=DB_CONFIG["host"],
+        help="PostgreSQL host.",
+    )
+    parser.add_argument(
+        "--db-port",
+        type=int,
+        default=DB_CONFIG["port"],
+        help="PostgreSQL port.",
+    )
+    parser.add_argument(
+        "--db-user",
+        type=str,
+        default=DB_CONFIG["user"],
+        help="PostgreSQL user.",
+    )
+    parser.add_argument(
+        "--db-password",
+        type=str,
+        default=DB_CONFIG["password"],
+        help="PostgreSQL password.",
+    )
+    parser.add_argument(
+        "--db-name",
+        type=str,
+        default=DB_CONFIG["database"],
+        help="PostgreSQL database name.",
+    )
+    parser.add_argument(
+        "--seed-csv",
+        type=str,
+        default="",
+        help="Comma-separated seed URLs (alternative to repeating --seed).",
+    )
+    parser.add_argument(
+        "--allowed-domain-csv",
+        type=str,
+        default="",
+        help="Comma-separated allowed domains/prefixes (alternative to repeating --allowed-domain).",
+    )
+
+    args = parser.parse_args()
+
+    # Apply CLI overrides
+    CRAWLER_CONFIG["num_workers"] = max(1, int(args.workers))
+    CRAWLER_CONFIG["max_pages"] = max(0, int(args.max_pages))
+    CRAWLER_CONFIG["use_selenium"] = bool(args.use_selenium)
+    CRAWLER_CONFIG["gecko_driver"] = args.gecko_driver
+
+    DB_CONFIG.update(
+        {
+            "host": args.db_host,
+            "port": int(args.db_port),
+            "user": args.db_user,
+            "password": args.db_password,
+            "database": args.db_name,
+        }
+    )
+
+    seed_urls = list(args.seed)
+    if args.seed_csv:
+        seed_urls.extend(_csv_list(args.seed_csv))
+    if not seed_urls:
+        seed_urls = [
+            "https://github.com/topics/foss",
+            "https://github.com/topics/open-source",
+            "https://github.com/topics/free-software",
+        ]
+
+    allowed_domains = list(args.allowed_domain)
+    if args.allowed_domain_csv:
+        allowed_domains.extend(_csv_list(args.allowed_domain_csv))
+    if not allowed_domains:
+        allowed_domains = ["https://github.com"]
 
     crawler = Crawler(
-        seed_urls=SEED_URLS,
-        allowed_domains=ALLOWED_DOMAINS,
-        target_description=TARGET_DESCRIPTION,
+        seed_urls=seed_urls,
+        allowed_domains=allowed_domains,
+        target_description=args.target_description,
     )
     crawler.run()

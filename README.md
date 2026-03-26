@@ -57,6 +57,18 @@ echo 'export GITHUB_TOKEN="ghp_yourtoken"' >> ~/.bashrc
 source ~/.bashrc
 ```
 
+Windows (PowerShell, current session):
+
+```powershell
+$env:GITHUB_TOKEN="ghp_yourtoken"
+```
+
+Windows (Command Prompt, current session):
+
+```cmd
+set "GITHUB_TOKEN=ghp_yourtoken"
+```
+
 The crawler detects the token automatically at startup and sets the crawl delay accordingly (`5s` authenticated, `60s` anonymous).
 
 ---
@@ -99,18 +111,10 @@ docker exec -i postgresql-wier psql -U user -d wier < init-scripts/database.sql
 
 ## 5. Configure the crawler
 
-Edit the entry point at the bottom of `crawler.py`, DEFAULTS:
+The crawler can be configured via command-line arguments (recommended). Run this to see all options:
 
-```python
-SEED_URLS = [
-    "https://github.com/topics/foss",
-    "https://github.com/topics/open-source",
-    "https://github.com/topics/free-software",
-]
-
-ALLOWED_DOMAINS = ["https://github.com"]
-
-TARGET_DESCRIPTION = "open source foss free software repository project"
+```bash
+python crawler.py --help
 ```
 
 Key settings in `CRAWLER_CONFIG`:
@@ -120,15 +124,55 @@ Key settings in `CRAWLER_CONFIG`:
 | `num_workers` | 5 | Parallel crawl threads |
 | `default_delay` | 5 / 60 | Seconds between requests (5 with token, 60 without) |
 | `use_selenium` | True | Use Firefox for JS rendering |
-| `max_pages` | 5000 | Stop after N pages (0 = no limit) |
-| `gecko_driver` | `./geckodriver` | Path to GeckoDriver binary |
+| `max_pages` | 100 | Stop after N pages (0 = no limit) |
+| `gecko_driver` | `./geckodriver.exe` | Path to GeckoDriver binary |
 
 ---
 
 ## 6. Run
 
+Minimal:
+
 ```bash
 python crawler.py
+```
+
+Recommended (arguments): set workers / max pages / seeds / allowed domains.
+
+Windows (Command Prompt):
+
+```cmd
+set "GITHUB_TOKEN=ghp_yourtoken"
+python crawler.py ^
+  --workers 10 ^
+  --max-pages 5000 ^
+  --use-selenium 0 ^
+  --allowed-domain https://github.com ^
+  --seed https://github.com/topics/foss ^
+  --seed https://github.com/topics/open-source ^
+  --seed https://github.com/topics/free-software ^
+  --target-description "open source foss free software repository project"
+```
+
+Windows (PowerShell):
+
+```powershell
+$env:GITHUB_TOKEN="ghp_yourtoken"
+python crawler.py `
+  --workers 10 `
+  --max-pages 5000 `
+  --use-selenium 0 `
+  --allowed-domain https://github.com `
+  --seed https://github.com/topics/foss `
+  --seed https://github.com/topics/open-source `
+  --seed https://github.com/topics/free-software `
+  --target-description "open source foss free software repository project"
+```
+
+Selenium mode (requires Firefox + `geckodriver.exe` next to `crawler.py`):
+
+```bash
+python crawler.py --use-selenium 1 --gecko-driver ./geckodriver.exe
 ```
 
 The crawler prints INFO:
