@@ -1,15 +1,17 @@
-# GitHub FOSS Crawler – Setup & Run Guide
+# WIER PA1 – Preferential Web Crawler
+
+Single-file crawler (`crawler.py`) backed by PostgreSQL **`crawldb`**: multi-threaded workers, frontier in the DB, robots.txt + sitemaps, IP politeness (min **5 s** per IP by default), URL canonicalization, preferential priority (BoW cosine similarity), exact duplicates (content hash), optional near-duplicates (MinHash LSH + Jaccard), `href` + `onclick` links, `img` extraction, HTML in `page.html_content`, binary metadata in `page_data` with **NULL** payloads by default.
 
 ## Folder structure
 
 ```
-crawler/
-├── crawler.py              ← main crawler (all logic in one file)
-├── requirements.txt        ← Python dependencies
+web-assignment-1/
+├── crawler.py              ← PA1 crawler (all logic in one file)
+├── requirements.txt
 ├── init-scripts/
-│   └── database.sql        ← PostgreSQL schema (auto-run by Docker)
-├── pgdata/                 ← Postgres data volume (created by Docker)
-└── geckodriver             ← Firefox WebDriver binary (download separately)
+│   └── database.sql        ← crawldb schema (Docker init or manual load)
+├── pgdata/                 ← Postgres data (Docker volume)
+└── geckodriver             ← optional; for Selenium + Firefox
 ```
 
 ---
@@ -22,58 +24,32 @@ pip install -r requirements.txt
 
 ---
 
-## 2. Download GeckoDriver (Firefox WebDriver)
+## 2. GeckoDriver + Firefox (optional)
 
-Download from: https://github.com/mozilla/geckodriver/releases
+Only needed if you run with **`--use-selenium 1`** (default in config). Download GeckoDriver: https://github.com/mozilla/geckodriver/releases  
 
-Place the binary next to `crawler.py`:
-```bash
-# Linux / macOS
-tar -xzf geckodriver-*.tar.gz
-chmod +x geckodriver
-mv geckodriver /path/to/crawler/geckodriver
+Place the binary next to `crawler.py` and set **`--gecko-driver`** (default in code: `./geckodriver`; on Windows you may use `geckodriver.exe`).
 
-# then set "gecko_driver": "geckodriver" in CRAWLER_CONFIG
-```
-
-Set `use_selenium: False` in `CRAWLER_CONFIG` if you want requests-only mode (faster, no JS rendering).
+Use **`--use-selenium 0`** for **requests-only** mode (no Firefox, faster, no JS rendering in the browser).
 
 ---
 
-## 3. Set GitHub token (recommended)
+## 3. `GITHUB_TOKEN` (optional)
 
-Without a token the GitHub API allows only **60 requests/hour** (1 req/min).
-With a token it allows **5,000 requests/hour**.
-
-Generate one at: https://github.com/settings/tokens
-No scopes needed — leave everything unchecked for public repo access.
-
-```fish
-# Fish shell — persists across sessions
-set -Ux GITHUB_TOKEN "ghp_yourtoken"
-
-# Bash / Zsh
-echo 'export GITHUB_TOKEN="ghp_yourtoken"' >> ~/.bashrc
-source ~/.bashrc
-```
-
-Windows (PowerShell, current session):
+If set, HTTP requests to **`github.com`**, **`*.github.com`**, and **`api.github.com`** send **`Authorization: Bearer …`** (and `Accept` for the API host). This can help with GitHub rate limits on HTML and API traffic; **politeness remains `default_delay` (5 s) per IP** unless you change config.
 
 ```powershell
+# Windows PowerShell (current session)
 $env:GITHUB_TOKEN="ghp_yourtoken"
 ```
-
-Windows (Command Prompt, current session):
 
 ```cmd
 set "GITHUB_TOKEN=ghp_yourtoken"
 ```
 
-The crawler uses **5 seconds** between requests per IP by default (politeness), same with or without a token. The token only affects **GitHub REST API** quota for structured extraction (higher limits when authenticated).
-
 ---
 
-## 4. Start PostgreSQL with Docker
+## 4. PostgreSQL (Docker)
 
 ```bash
 # Linux / macOS
@@ -81,12 +57,15 @@ docker run --name postgresql-wier \
     -e POSTGRES_PASSWORD=SecretPassword \
     -e POSTGRES_USER=user \
     -e POSTGRES_DB=wier \
-    -v $PWD/pgdata:/var/lib/postgresql/data \
-    -v $PWD/init-scripts:/docker-entrypoint-initdb.d \
+    -v "$PWD/pgdata:/var/lib/postgresql/data" \
+    -v "$PWD/init-scripts:/docker-entrypoint-initdb.d" \
     -p 5432:5432 \
     -d pgvector/pgvector:pg17
+```
 
-# Windows Command Prompt
+Windows **cmd** (use `%CD%`, not `$PWD`):
+
+```cmd
 docker run --name postgresql-wier ^
     -e POSTGRES_PASSWORD=SecretPassword ^
     -e POSTGRES_USER=user ^
@@ -97,35 +76,34 @@ docker run --name postgresql-wier ^
     -d pgvector/pgvector:pg17
 ```
 
-Check it's running:
-```bash
-docker logs -f postgresql-wier
-```
+Load or refresh the schema (if not applied by init). The DDL file is **`init-scripts/database.sql`** (PA1 `crawldb`; this replaces the older `db_test.sql` name).
 
-Execute the following command to start the tables and schemas:
 ```bash
 docker exec -i postgresql-wier psql -U user -d wier < init-scripts/database.sql
 ```
 
+Credentials match `DB_CONFIG` in `crawler.py` (`user` / `SecretPassword` / `wier`), overridable with **`--db-*`** flags.
+
 ---
 
-## 5. Configure the crawler
-
-The crawler can be configured via command-line arguments (recommended). Run this to see all options:
+## 5. Configure / CLI
 
 ```bash
 python crawler.py --help
 ```
 
-Key settings in `CRAWLER_CONFIG`:
+| Flag / setting | Default (typical) | Notes |
+|----------------|-------------------|--------|
+| `--workers` | `5` | Worker threads |
+| `--max-pages` | `5000` | Stop after this many **HTML** pages stored |
+| `--use-selenium` | `1` | `0` = requests only, `1` = Firefox when needed |
+| `--gecko-driver` | `./geckodriver` | Path to GeckoDriver |
+| `--seed` | (repeatable) | Default seed if none: `https://github.com/topics/machine-learning` |
+| `--allowed-domain` | (repeatable) | Default if none: `https://github.com` |
+| `--target-description` | ML-related string | BoW priority target (see `--help` default) |
+| `--db-host` … `--db-name` | `localhost`, `5432`, `user`, `SecretPassword`, `wier` | |
 
-| Setting | Default | Description |
-|---|---|---|
-| `num_workers` | 5 | Parallel crawl threads |
-| `default_delay` | 5 | Minimum seconds between requests per IP (politeness) |
-| `use_selenium` | True | Use Firefox for JS rendering |
-| `max_pages` | 100 | Stop after N pages (0 = no limit) |
-| `gecko_driver` | `./geckodriver.exe` | Path to GeckoDriver binary |
+Key entries in `CRAWLER_CONFIG` inside the file: `default_delay` (**5**), `max_html_pages`, `near_duplicate_lsh`, `jaccard_threshold`, `store_*_payload` (all **False** = metadata only for binaries/images).
 
 ---
 
@@ -137,57 +115,43 @@ Minimal:
 python crawler.py
 ```
 
-Recommended (arguments): set workers / max pages / seeds / allowed domains.
-
-Windows (Command Prompt):
-
-```cmd
-set "GITHUB_TOKEN=ghp_yourtoken"
-python crawler.py ^
-  --workers 10 ^
-  --max-pages 5000 ^
-  --use-selenium 0 ^
-  --allowed-domain https://github.com ^
-  --seed https://github.com/topics/foss ^
-  --seed https://github.com/topics/open-source ^
-  --seed https://github.com/topics/free-software ^
-  --target-description "open source foss free software repository project"
-```
-
-Windows (PowerShell):
+Example with explicit seeds and domain:
 
 ```powershell
-$env:GITHUB_TOKEN="ghp_yourtoken"
 python crawler.py `
-  --workers 10 `
+  --workers 5 `
   --max-pages 5000 `
   --use-selenium 0 `
   --allowed-domain https://github.com `
-  --seed https://github.com/topics/foss `
-  --seed https://github.com/topics/open-source `
-  --seed https://github.com/topics/free-software `
-  --target-description "open source foss free software repository project"
+  --seed https://github.com/topics/machine-learning `
+  --target-description "open source machine learning repositories"
 ```
 
-Selenium mode (requires Firefox + `geckodriver.exe` next to `crawler.py`):
+Typical log lines:
 
-```bash
-python crawler.py --use-selenium 1 --gecko-driver ./geckodriver.exe
+```
+Status: html=120 frontier=3400
+[Worker-1] INFO - Crawling https://github.com/...
+[Worker-3] INFO - Near duplicate 0.880: 267718 -> 365
 ```
 
-The crawler prints INFO:
-```
-[Worker-1] INFO - Crawling: https://github.com/topics/foss
-[Worker-5] INFO - GitHub extracted: torvalds/linux (repo_id=1)
-INFO - Status: crawled=120, frontier=3400
-```
+---
 
-To wipe the database and start fresh:
+## 7. Reset `crawldb` (PA1 tables only)
+
+This matches the current **`database.sql`** schema (no GitHub FOSS `repo` / `issue` tables):
+
 ```bash
 docker exec -it postgresql-wier psql -U user -d wier -c "
-  TRUNCATE crawldb.issue_comment, crawldb.issue_label, crawldb.issue,
-           crawldb.doc_link, crawldb.repo_topic, crawldb.readme,
-           crawldb.repo, crawldb.image, crawldb.page_data,
-           crawldb.link, crawldb.page, crawldb.site CASCADE;
+TRUNCATE crawldb.link,
+         crawldb.page_data,
+         crawldb.image,
+         crawldb.page_signature,
+         crawldb.page,
+         crawldb.crawl_run,
+         crawldb.site
+RESTART IDENTITY CASCADE;
 "
 ```
+
+If `TRUNCATE` fails on self-FK on `page`, run the same with only the tables your Postgres version accepts, or drop/recreate schema from `init-scripts/database.sql`.

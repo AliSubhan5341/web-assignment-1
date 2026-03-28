@@ -567,7 +567,7 @@ class Fetcher:
                 elif "powerpoint" in ct or "application/vnd.ms-powerpoint" in ct:
                     inferred_type = "PPTX" if "openxmlformats-officedocument.presentationml.presentation" in ct else "PPT"
                 elif "excel" in ct or "spreadsheetml.sheet" in ct:
-                    # XLS / XLSX are optional extensions in db_test.sql.
+                    # XLS / XLSX are optional extensions in database.sql.
                     inferred_type = "XLSX" if "spreadsheetml.sheet" in ct else "XLS"
 
                 store_payload = (
