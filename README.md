@@ -69,7 +69,7 @@ Windows (Command Prompt, current session):
 set "GITHUB_TOKEN=ghp_yourtoken"
 ```
 
-The crawler detects the token automatically at startup and sets the crawl delay accordingly (`5s` authenticated, `60s` anonymous).
+The crawler uses **5 seconds** between requests per IP by default (politeness), same with or without a token. The token only affects **GitHub REST API** quota for structured extraction (higher limits when authenticated).
 
 ---
 
@@ -122,7 +122,7 @@ Key settings in `CRAWLER_CONFIG`:
 | Setting | Default | Description |
 |---|---|---|
 | `num_workers` | 5 | Parallel crawl threads |
-| `default_delay` | 5 / 60 | Seconds between requests (5 with token, 60 without) |
+| `default_delay` | 5 | Minimum seconds between requests per IP (politeness) |
 | `use_selenium` | True | Use Firefox for JS rendering |
 | `max_pages` | 100 | Stop after N pages (0 = no limit) |
 | `gecko_driver` | `./geckodriver.exe` | Path to GeckoDriver binary |
